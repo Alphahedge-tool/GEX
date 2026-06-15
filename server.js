@@ -1,10 +1,11 @@
 import http from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const publicRoot = join(__dirname, "public");
+const distRoot = join(__dirname, "dist");
 const port = Number(process.env.PORT || 5174);
 
 const mime = {
@@ -310,9 +311,17 @@ async function proxy(req, res) {
 async function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const requested = url.pathname === "/" ? "/index.html" : decodeURIComponent(url.pathname);
-  const filePath = normalize(join(publicRoot, requested));
+  let root = publicRoot;
+  try {
+    const distIndex = await stat(join(distRoot, "index.html"));
+    if (distIndex.isFile()) root = distRoot;
+  } catch {
+    root = publicRoot;
+  }
 
-  if (filePath !== publicRoot && !filePath.startsWith(`${publicRoot}${sep}`)) {
+  const filePath = normalize(join(root, requested));
+
+  if (filePath !== root && !filePath.startsWith(`${root}${sep}`)) {
     sendJson(res, 403, { error: "Forbidden" });
     return;
   }

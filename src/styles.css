@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: #0b0e11;
+    color: #e5e7eb;
+    font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    font-feature-settings: "tnum" 1;
+  }
+
+  input,
+  select,
+  button {
+    font: inherit;
+  }
+
+  select,
+  input[type="datetime-local"] {
+    color-scheme: dark;
+  }
+
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #0b0e11;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #2a3139;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3a444f;
+  }
+}
+
+@layer components {
+  .terminal-input {
+    @apply h-7 border border-gray-700 bg-[#0B0E11] px-2 py-1 font-mono text-[11px] font-semibold text-gray-100 outline-none transition-colors placeholder:text-gray-600 focus:border-cyan-500;
+  }
+
+  .terminal-label {
+    @apply flex items-center gap-2 text-[11px] font-medium text-gray-400;
+  }
+
+  .terminal-button {
+    @apply bg-cyan-600 px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-cyan-500 disabled:cursor-wait disabled:opacity-50;
+  }
+
+  .terminal-button-secondary {
+    @apply border border-gray-700 bg-[#1A1F25] px-3 py-1.5 text-xs font-medium text-gray-200 transition-colors hover:border-gray-500 hover:bg-[#20262D] disabled:cursor-wait disabled:opacity-50;
+  }
+
+  .metric-label {
+    @apply shrink-0 text-[10px] font-medium uppercase tracking-normal text-slate-400;
+  }
+
+  .metric-value {
+    @apply min-w-0 truncate font-mono text-[13px] font-semibold leading-none text-slate-50;
+  }
+
+  .chart-surface {
+    @apply min-h-[calc(100vh-205px)] w-full border border-gray-800 bg-[#0B0E11];
+  }
+}

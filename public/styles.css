@@ -489,6 +489,94 @@ canvas {
   image-rendering: crisp-edges;
 }
 
+.rolling-panel {
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.rolling-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 18px 12px;
+  flex-wrap: wrap;
+}
+
+.rolling-header h2 {
+  font-size: 16px;
+}
+
+.rolling-header p {
+  font-size: 12px;
+  margin-top: 3px;
+}
+
+.rolling-controls {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
+.rolling-controls label {
+  font-size: 11px;
+  min-width: 100px;
+}
+
+.rolling-controls input,
+.rolling-controls select {
+  min-height: 34px;
+  font-size: 12px;
+}
+
+.rolling-controls button {
+  min-height: 34px;
+  align-self: flex-end;
+  white-space: nowrap;
+}
+
+.rolling-stats {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+  padding: 0 18px 12px;
+}
+
+.rolling-stats div {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 8px 10px;
+}
+
+.rolling-stats span {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rolling-stats strong {
+  display: block;
+  font-size: 13px;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.rolling-chart-wrap {
+  position: relative;
+  height: 320px;
+  padding: 0 18px 16px;
+}
+
+.rolling-tv-chart {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
 @media (max-width: 920px) {
   .shell {
     padding: 10px;
@@ -515,6 +603,10 @@ canvas {
   .gex-stats {
     grid-template-columns: repeat(3, 1fr);
   }
+
+  .rolling-stats {
+    grid-template-columns: repeat(3, 1fr);
+  }
 }
 
 @media (max-width: 520px) {
@@ -529,6 +621,10 @@ canvas {
   }
 
   .gex-stats {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .rolling-stats {
     grid-template-columns: 1fr 1fr;
   }
 }

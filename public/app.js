@@ -75,6 +75,9 @@ const tvState = {
   lineSeries: null,
   gexChart: null,
   gexBaselineSeries: null,
+  rollChart: null,
+  rollBidSeries: null,
+  rollAskSeries: null,
   syncLock: false
 };
 
@@ -106,6 +109,14 @@ function seedDates() {
   const istToday = new Date(end.getTime() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
   const gexDateEl = document.getElementById("gexDate");
   if (gexDateEl) gexDateEl.value = istToday;
+  const rollStartEl = document.getElementById("rollStart");
+  const rollEndEl = document.getElementById("rollEnd");
+  if (rollStartEl && rollEndEl) {
+    const rollEnd = new Date();
+    const rollStart = new Date(rollEnd.getTime() - 30 * 60 * 1000);
+    rollStartEl.value = toLocalInput(rollStart);
+    rollEndEl.value = toLocalInput(rollEnd);
+  }
 }
 
 function seedAuth() {
@@ -859,6 +870,9 @@ function resizeTvCharts() {
   if (!tvState.mainChart) return;
   tvState.mainChart.resize(els.tvChart.clientWidth, els.tvChart.clientHeight);
   tvState.gexChart.resize(els.gexTvChart.clientWidth, els.gexTvChart.clientHeight);
+  if (tvState.rollChart && rollEls.chart) {
+    tvState.rollChart.resize(rollEls.chart.clientWidth, rollEls.chart.clientHeight);
+  }
 }
 
 function renderOverlay(width, height, dpr, candles, scale) {
@@ -2185,6 +2199,288 @@ window.addEventListener("resize", () => { if (gexHist.points.length) renderGexHi
 // ─── End GEX History ─────────────────────────────────────────────────────────
 
 // ─── End GEX ─────────────────────────────────────────────────────────────────
+
+// Rolling Straddle
+
+const rollEls = {
+  symbol: $("rollSymbol"),
+  type: $("rollType"),
+  exchange: $("rollExchange"),
+  expiry: $("rollExpiry"),
+  start: $("rollStart"),
+  end: $("rollEnd"),
+  loadExpiries: $("rollLoadExpiries"),
+  load: $("rollLoad"),
+  chart: $("rollChart"),
+  meta: $("rollMeta"),
+  spot: $("rollSpot"),
+  strike: $("rollStrike"),
+  bid: $("rollBid"),
+  ask: $("rollAsk"),
+  points: $("rollPoints"),
+  status: $("rollStatus")
+};
+
+function setRollStatus(text) {
+  rollEls.status.textContent = text;
+}
+
+function initRollingChart() {
+  if (!window.LightweightCharts || tvState.rollChart) return;
+  tvState.rollChart = LightweightCharts.createChart(rollEls.chart, {
+    ...tvChartOptions(),
+    timeScale: {
+      borderColor: cssVar("--line"),
+      timeVisible: true,
+      secondsVisible: true,
+      rightOffset: 8,
+      barSpacing: 5,
+      tickMarkFormatter: formatLwIstTime
+    },
+    rightPriceScale: {
+      borderColor: cssVar("--line"),
+      scaleMargins: { top: 0.12, bottom: 0.12 }
+    }
+  });
+  const bidOptions = { color: cssVar("--up"), lineWidth: 2, title: "Bid straddle" };
+  const askOptions = { color: cssVar("--accent-2"), lineWidth: 2, title: "Ask straddle" };
+  tvState.rollBidSeries = tvState.rollChart.addLineSeries
+    ? tvState.rollChart.addLineSeries(bidOptions)
+    : tvState.rollChart.addSeries(LightweightCharts.LineSeries, bidOptions);
+  tvState.rollAskSeries = tvState.rollChart.addLineSeries
+    ? tvState.rollChart.addLineSeries(askOptions)
+    : tvState.rollChart.addSeries(LightweightCharts.LineSeries, askOptions);
+}
+
+function rollingRefDate() {
+  return rollEls.start.value ? rollEls.start.value.slice(0, 10) : new Date().toISOString().slice(0, 10);
+}
+
+function normalizeStrike(value) {
+  const rupeeValue = toRupees(value);
+  return rupeeValue == null ? Number(value) : rupeeValue;
+}
+
+function optionRowSide(row) {
+  return String(row.option_type || row.ot || row.side || "").toUpperCase();
+}
+
+async function rollingOptionRows() {
+  const symbol = rollEls.symbol.value.trim().toUpperCase();
+  const exchange = rollEls.exchange.value;
+  if (!symbol) throw new Error("Rolling Straddle symbol is required.");
+  const data = await nubraFetch(`refdata/refdata/${rollingRefDate()}?exchange=${exchange}`, { method: "GET" });
+  const refRows = Array.isArray(data.refdata) ? data.refdata : [];
+  return refRows
+    .filter((row) => {
+      const asset = String(row.asset || "").toUpperCase();
+      const dtype = String(row.derivative_type || "").toUpperCase();
+      const side = optionRowSide(row);
+      return asset === symbol && dtype === "OPT" && (side === "CE" || side === "PE") && row.stock_name;
+    })
+    .map((row) => ({
+      name: row.stock_name,
+      expiry: String(row.expiry || ""),
+      side: optionRowSide(row),
+      strike: normalizeStrike(row.strike_price)
+    }))
+    .filter((row) => Number.isFinite(row.strike) && row.expiry);
+}
+
+async function loadRollingExpiries() {
+  setRollStatus("Refdata");
+  const rows = await rollingOptionRows();
+  const expiries = [...new Set(rows.map((row) => row.expiry))].sort();
+  if (!expiries.length) throw new Error("No option expiries found for the rolling straddle symbol.");
+  const current = rollEls.expiry.value;
+  rollEls.expiry.innerHTML = expiries
+    .map((expiry) => `<option value="${expiry}"${expiry === current ? " selected" : ""}>${expiry}</option>`)
+    .join("");
+  if (!rollEls.expiry.value) rollEls.expiry.value = expiries[0];
+  setRollStatus(`${expiries.length} expiries`);
+}
+
+function inferStrikeStep(strikes) {
+  const unique = [...new Set(strikes)].sort((a, b) => a - b);
+  let step = Infinity;
+  for (let i = 1; i < unique.length; i++) {
+    const diff = unique[i] - unique[i - 1];
+    if (diff > 0) step = Math.min(step, diff);
+  }
+  return Number.isFinite(step) ? step : 50;
+}
+
+function nearestStrike(price, strikes, step) {
+  const target = Math.round(price / step) * step;
+  return strikes.reduce((best, strike) =>
+    Math.abs(strike - target) < Math.abs(best - target) ? strike : best, strikes[0]);
+}
+
+async function fetchRollingSeries(names, exchange, startDate, endDate) {
+  const seriesByName = new Map();
+  const batchSize = 8;
+  const total = Math.ceil(names.length / batchSize);
+  for (let b = 0; b < total; b++) {
+    const batch = names.slice(b * batchSize, (b + 1) * batchSize);
+    setRollStatus(`Batch ${b + 1}/${total}`);
+    const data = await nubraFetch("charts/timeseries", {
+      method: "POST",
+      body: JSON.stringify({
+        query: [{
+          exchange,
+          type: "OPT",
+          values: batch,
+          fields: ["l1bid", "l1ask"],
+          startDate,
+          endDate,
+          interval: "1s",
+          intraDay: false,
+          realTime: false
+        }]
+      })
+    });
+    for (const entry of data?.result?.[0]?.values || []) {
+      for (const [name, symData] of Object.entries(entry)) {
+        seriesByName.set(name, {
+          bid: (Array.isArray(symData?.l1bid) ? symData.l1bid : [])
+            .map((p) => ({ ts: pointMs(p), v: pointNumber(p, true) }))
+            .filter((p) => Number.isFinite(p.ts) && Number.isFinite(p.v))
+            .sort((a, b) => a.ts - b.ts),
+          ask: (Array.isArray(symData?.l1ask) ? symData.l1ask : [])
+            .map((p) => ({ ts: pointMs(p), v: pointNumber(p, true) }))
+            .filter((p) => Number.isFinite(p.ts) && Number.isFinite(p.v))
+            .sort((a, b) => a.ts - b.ts)
+        });
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  return seriesByName;
+}
+
+function advanceRollingCursor(name, seriesByName, cursorByName, ts) {
+  const series = seriesByName.get(name);
+  if (!series) return { bid: 0, ask: 0 };
+  const cursor = cursorByName.get(name) || { bidIndex: 0, askIndex: 0, bid: 0, ask: 0 };
+  while (cursor.bidIndex < series.bid.length && series.bid[cursor.bidIndex].ts <= ts) {
+    cursor.bid = series.bid[cursor.bidIndex].v;
+    cursor.bidIndex += 1;
+  }
+  while (cursor.askIndex < series.ask.length && series.ask[cursor.askIndex].ts <= ts) {
+    cursor.ask = series.ask[cursor.askIndex].v;
+    cursor.askIndex += 1;
+  }
+  cursorByName.set(name, cursor);
+  return cursor;
+}
+
+async function loadRollingStraddle() {
+  const symbol = rollEls.symbol.value.trim().toUpperCase();
+  const exchange = rollEls.exchange.value;
+  const startDate = fromLocalInput(rollEls.start.value);
+  const endDate = fromLocalInput(rollEls.end.value);
+  if (!symbol) throw new Error("Rolling Straddle symbol is required.");
+  if (!startDate || !endDate) throw new Error("Rolling Straddle start and end are required.");
+
+  setRollStatus("Spot");
+  const spotData = await nubraFetch("charts/timeseries", {
+    method: "POST",
+    body: JSON.stringify({
+      query: [{
+        exchange,
+        type: rollEls.type.value,
+        values: [symbol],
+        fields: ["close"],
+        startDate,
+        endDate,
+        interval: "1s",
+        intraDay: false,
+        realTime: false
+      }]
+    })
+  });
+  const spotSymbolData = extractSymbolData(spotData, symbol);
+  const spotPoints = (Array.isArray(spotSymbolData?.close) ? spotSymbolData.close : [])
+    .map((p) => ({ ts: pointMs(p), spot: pointNumber(p, true) }))
+    .filter((p) => Number.isFinite(p.ts) && p.spot > 0)
+    .sort((a, b) => a.ts - b.ts);
+  if (!spotPoints.length) throw new Error("No 1-second spot data returned.");
+
+  setRollStatus("Refdata");
+  let rows = await rollingOptionRows();
+  if (!rollEls.expiry.value) await loadRollingExpiries();
+  const expiry = rollEls.expiry.value || rows[0]?.expiry;
+  rows = rows.filter((row) => row.expiry === expiry);
+  if (!rows.length) throw new Error("No option rows found for selected expiry.");
+
+  const strikes = [...new Set(rows.map((row) => row.strike))].sort((a, b) => a - b);
+  const step = inferStrikeStep(strikes);
+  const rowByKey = new Map(rows.map((row) => [`${row.strike}|${row.side}`, row]));
+  const requiredStrikes = new Set();
+  for (const point of spotPoints) {
+    const atm = nearestStrike(point.spot, strikes, step);
+    for (let offset = -2; offset <= 2; offset++) {
+      const strike = nearestStrike(atm + offset * step, strikes, step);
+      requiredStrikes.add(strike);
+    }
+  }
+
+  const optionNames = [];
+  for (const strike of requiredStrikes) {
+    const ce = rowByKey.get(`${strike}|CE`);
+    const pe = rowByKey.get(`${strike}|PE`);
+    if (ce) optionNames.push(ce.name);
+    if (pe) optionNames.push(pe.name);
+  }
+  if (!optionNames.length) throw new Error("No CE/PE symbols found around ATM +/-2.");
+
+  const seriesByName = await fetchRollingSeries([...new Set(optionNames)], exchange, startDate, endDate);
+  const cursorByName = new Map();
+  const bidLine = [];
+  const askLine = [];
+  const selected = [];
+
+  for (const point of spotPoints) {
+    const atm = nearestStrike(point.spot, strikes, step);
+    let best = null;
+    for (let offset = -2; offset <= 2; offset++) {
+      const strike = nearestStrike(atm + offset * step, strikes, step);
+      const ce = rowByKey.get(`${strike}|CE`);
+      const pe = rowByKey.get(`${strike}|PE`);
+      if (!ce || !pe) continue;
+      const ceQuote = advanceRollingCursor(ce.name, seriesByName, cursorByName, point.ts);
+      const peQuote = advanceRollingCursor(pe.name, seriesByName, cursorByName, point.ts);
+      const bid = ceQuote.bid + peQuote.bid;
+      const ask = ceQuote.ask + peQuote.ask;
+      if (bid <= 0 || ask <= 0) continue;
+      const mid = (bid + ask) / 2;
+      if (!best || mid < best.mid) best = { strike, bid, ask, mid };
+    }
+    if (!best) continue;
+    const time = tvTime(point.ts);
+    bidLine.push({ time, value: best.bid });
+    askLine.push({ time, value: best.ask });
+    selected.push({ ...point, ...best });
+  }
+
+  if (!selected.length) throw new Error("No complete bid/ask straddle points found.");
+  initRollingChart();
+  tvState.rollBidSeries.setData(bidLine);
+  tvState.rollAskSeries.setData(askLine);
+  tvState.rollChart.timeScale().fitContent();
+
+  const last = selected[selected.length - 1];
+  rollEls.spot.textContent = rupee.format(last.spot);
+  rollEls.strike.textContent = number.format(last.strike);
+  rollEls.bid.textContent = rupee.format(last.bid);
+  rollEls.ask.textContent = rupee.format(last.ask);
+  rollEls.points.textContent = String(selected.length);
+  rollEls.meta.textContent = `${symbol} ${expiry} | 1s l1bid/l1ask | ${requiredStrikes.size} strikes | ${exchange}`;
+  setRollStatus("Ready");
+}
+
+bindSafe(rollEls.loadExpiries, loadRollingExpiries);
+bindSafe(rollEls.load, loadRollingStraddle);
 
 seedDates();
 seedAuth();
