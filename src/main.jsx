@@ -1,6 +1,20 @@
-import { createEffect, createMemo, createSignal, For, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onMount, Show, untrack } from "solid-js";
 import { render } from "solid-js/web";
 import "./styles.css";
+
+// Writes rows as a JSON file (saved with .parquet extension).
+// Each row is a plain object; field names match the CSV headers.
+function writeParquet(_columns, rows) {
+  return new TextEncoder().encode(JSON.stringify(rows));
+}
+
+// Reads a JSON file written by writeParquet above.
+function readParquet(buffer) {
+  const text = new TextDecoder().decode(buffer);
+  const rows = JSON.parse(text);
+  if (!Array.isArray(rows) || rows.length === 0) throw new Error("No data rows found in file.");
+  return rows;
+}
 
 const rupee = new Intl.NumberFormat("en-IN", {
   style: "currency",
@@ -8,6 +22,7 @@ const rupee = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2
 });
 const number = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 2 });
+const compactNumber = new Intl.NumberFormat("en-IN", { notation: "compact", maximumFractionDigits: 1 });
 
 function toRupees(value) {
   const n = Number(value);
@@ -25,9 +40,58 @@ function pointNumber(point, rupeeValue = false) {
   return Number.isFinite(value) ? value : 0;
 }
 
+function formatMoney(value) {
+  const n = toRupees(value);
+  return n == null ? "--" : rupee.format(n);
+}
+
+function formatStrike(value) {
+  const n = toRupees(value);
+  return n == null ? "--" : number.format(n);
+}
+
+function formatPlain(value, digits = 2) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n.toFixed(digits) : "--";
+}
+
+function formatCompact(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? compactNumber.format(n) : "--";
+}
+
+function pickOptionValue(option, keys) {
+  if (!option) return undefined;
+  for (const key of keys) {
+    if (option[key] != null) return option[key];
+  }
+  return undefined;
+}
+
+const CHAIN_COLUMNS = [
+  { key: "ltp", label: "LTP" },
+  { key: "iv", label: "IV (%)" },
+  { key: "delta", label: "Delta" },
+  { key: "gamma", label: "Gamma" },
+  { key: "theta", label: "Theta" },
+  { key: "vega", label: "Vega" },
+  { key: "volume", label: "Volume" },
+  { key: "oi", label: "OI" }
+];
+
+const CALL_COLUMN_ORDER = ["volume", "oi", "vega", "theta", "gamma", "delta", "iv", "ltp"];
+const PUT_COLUMN_ORDER = ["ltp", "iv", "delta", "gamma", "theta", "vega", "volume", "oi"];
+const DEFAULT_CHAIN_COLUMNS = Object.fromEntries(CHAIN_COLUMNS.map((column) => [column.key, true]));
+
 function toLocalInput(date) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function todayAt(hour, minute) {
+  const date = new Date();
+  date.setHours(hour, minute, 0, 0);
+  return date;
 }
 
 function fromLocalInput(value) {
@@ -136,17 +200,31 @@ function App() {
   const [rollExchange, setRollExchange] = createSignal("NSE");
   const [rollExpiry, setRollExpiry] = createSignal("");
   const [rollExpiries, setRollExpiries] = createSignal([]);
-  const [rollStart, setRollStart] = createSignal(toLocalInput(new Date(now.getTime() - 30 * 60 * 1000)));
-  const [rollEnd, setRollEnd] = createSignal(toLocalInput(now));
+  const [rollStart, setRollStart] = createSignal(toLocalInput(todayAt(9, 15)));
+  const [rollEnd, setRollEnd] = createSignal(toLocalInput(todayAt(15, 30)));
   const [rollStatus, setRollStatus] = createSignal("Idle");
   const [rollStats, setRollStats] = createSignal({
     spot: "--",
     strike: "--",
     bid: "--",
     ask: "--",
+    iv: "--",
     points: "0",
-    meta: "Lowest ATM +/-2 straddle, bid and ask, sampled at 1 second."
+    meta: "Lowest ATM +/-2 straddle, sampled every second."
   });
+  const [rollExportData, setRollExportData] = createSignal([]);
+  const [importMode, setImportMode] = createSignal(false);
+  let importFileRef;
+
+  const [chainSymbol, setChainSymbol] = createSignal("NIFTY");
+  const [chainExchange, setChainExchange] = createSignal("NSE");
+  const [chainExpiry, setChainExpiry] = createSignal("");
+  const [chainExpiries, setChainExpiries] = createSignal([]);
+  const [chainStatus, setChainStatus] = createSignal("Idle");
+  const [chainData, setChainData] = createSignal(null);
+  const [chainAtmRange, setChainAtmRange] = createSignal("");
+  const [chainColumnMenuOpen, setChainColumnMenuOpen] = createSignal(false);
+  const [chainVisibleColumns, setChainVisibleColumns] = createSignal({ ...DEFAULT_CHAIN_COLUMNS });
 
   let priceChartHost;
   let rollChartHost;
@@ -155,8 +233,88 @@ function App() {
   let rollChart;
   let rollBidSeries;
   let rollAskSeries;
+  let rollIvSeries;
+  let autoRollLoadedKey = "";
+  let autoChainLoadedKey = "";
 
   const authed = createMemo(() => Boolean(token().trim() && deviceId().trim()));
+  const optionRows = createMemo(() => {
+    const chain = chainData();
+    if (!chain) return [];
+    const byStrike = new Map();
+    for (const ce of Array.isArray(chain.ce) ? chain.ce : []) {
+      const strike = Number(ce.sp ?? ce.strike_price);
+      if (!Number.isFinite(strike)) continue;
+      byStrike.set(strike, { ...(byStrike.get(strike) || { strike }), ce });
+    }
+    for (const pe of Array.isArray(chain.pe) ? chain.pe : []) {
+      const strike = Number(pe.sp ?? pe.strike_price);
+      if (!Number.isFinite(strike)) continue;
+      byStrike.set(strike, { ...(byStrike.get(strike) || { strike }), pe });
+    }
+    return [...byStrike.values()].sort((a, b) => a.strike - b.strike);
+  });
+  const visibleCallColumns = createMemo(() => CALL_COLUMN_ORDER.filter((key) => chainVisibleColumns()[key]));
+  const visiblePutColumns = createMemo(() => PUT_COLUMN_ORDER.filter((key) => chainVisibleColumns()[key]));
+  const visibleOptionRows = createMemo(() => {
+    const filter = parseChainAtmFilter(chainAtmRange(), optionRows(), chainData()?.atm);
+    if (!filter) return optionRows();
+    return optionRows().filter((row) => Number(row.strike) >= filter.min && Number(row.strike) <= filter.max);
+  });
+  const visibleColumnCount = createMemo(() => visibleCallColumns().length);
+
+  function parseChainAtmFilter(rawValue, rows, atmValue) {
+    const raw = String(rawValue || "").trim().toLowerCase();
+    if (!raw) return null;
+    const atm = Number(atmValue);
+    if (!Number.isFinite(atm)) return null;
+    const match = raw.match(/([+-])?\s*(?:atm)?\s*([+-])?\s*(\d+(?:\.\d+)?)/);
+    if (!match) return null;
+    const sign = match[2] || match[1] || "";
+    const value = Number(match[3]);
+    if (!Number.isFinite(value) || value <= 0) return null;
+    const strikes = rows.map((row) => Number(row.strike)).filter(Number.isFinite);
+    const step = inferStrikeStep(strikes);
+    const distance = Number.isFinite(step) && step > 0 && Number.isInteger(value) && value <= 20
+      ? value * step
+      : value;
+    if (sign === "+") return { min: atm, max: atm + distance };
+    if (sign === "-") return { min: atm - distance, max: atm };
+    return { min: atm - distance, max: atm + distance };
+  }
+
+  function toggleChainColumn(key) {
+    setChainVisibleColumns((current) => {
+      const visibleCount = Object.values(current).filter(Boolean).length;
+      if (current[key] && visibleCount <= 1) return current;
+      return { ...current, [key]: !current[key] };
+    });
+  }
+
+  function showAllChainColumns() {
+    setChainVisibleColumns({ ...DEFAULT_CHAIN_COLUMNS });
+  }
+
+  function chainColumnLabel(key) {
+    return CHAIN_COLUMNS.find((column) => column.key === key)?.label || key;
+  }
+
+  function optionCellProps(option, key) {
+    switch (key) {
+      case "ltp":
+        return { value: option?.ltp, money: true, tone: "ltp" };
+      case "iv":
+        return { value: option?.iv, tone: "iv" };
+      case "gamma":
+        return { value: option?.gamma, digits: 5 };
+      case "volume":
+        return { value: option?.volume, compact: true };
+      case "oi":
+        return { value: option?.oi, compact: true, tone: "oi" };
+      default:
+        return { value: option?.[key] };
+    }
+  }
 
   function resizeChart(chart, host) {
     if (!chart || !host) return;
@@ -403,6 +561,68 @@ function App() {
     setRollStatus(`${expiries.length} expiries`);
   }
 
+  async function loadOptionChainExpiries() {
+    setChainStatus("Expiries");
+    const date = new Date().toISOString().slice(0, 10);
+    const data = await nubraFetch(`refdata/refdata/${date}?exchange=${chainExchange()}`);
+    const refRows = Array.isArray(data.refdata) ? data.refdata : [];
+    const sym = chainSymbol().trim().toUpperCase();
+    const expiries = [...new Set(refRows
+      .filter((row) => {
+        const asset = String(row.asset || "").toUpperCase();
+        const dtype = String(row.derivative_type || "").toUpperCase();
+        const side = optionRowSide(row);
+        return asset === sym && dtype === "OPT" && (side === "CE" || side === "PE") && row.expiry;
+      })
+      .map((row) => String(row.expiry)))]
+      .sort();
+    if (!expiries.length) throw new Error("No option expiries found for option chain.");
+    setChainExpiries(expiries);
+    setChainStatus(`${expiries.length} expiries`);
+    return expiries;
+  }
+
+  async function fetchOptionChainSnapshot(sym, expiry) {
+    const data = await nubraFetch(`optionchains/${encodeURIComponent(sym)}?exchange=${chainExchange()}&expiry=${encodeURIComponent(expiry)}`);
+    const chain = data?.chain;
+    if (!chain) throw new Error("No option chain returned.");
+    return chain;
+  }
+
+  async function loadOptionChain() {
+    setChainStatus("Loading");
+    const sym = chainSymbol().trim().toUpperCase();
+    if (!sym) throw new Error("Option Chain symbol is required.");
+    const expiries = chainExpiries().length ? chainExpiries() : await loadOptionChainExpiries();
+    const selectedExpiry = chainExpiry();
+    const candidates = selectedExpiry
+      ? [selectedExpiry, ...expiries.filter((expiry) => expiry !== selectedExpiry)]
+      : expiries;
+    if (!candidates.length) throw new Error("Option Chain expiry is required.");
+
+    let lastError;
+    for (const expiry of candidates) {
+      try {
+        setChainStatus(`Loading ${expiry}`);
+        const chain = await fetchOptionChainSnapshot(sym, expiry);
+        setChainData(chain);
+        setChainExpiry(String(chain.expiry || expiry));
+        if (Array.isArray(chain.all_expiries) && chain.all_expiries.length) {
+          setChainExpiries(chain.all_expiries.map(String).sort());
+        }
+        setChainStatus("Ready");
+        return;
+      } catch (err) {
+        lastError = err;
+        const message = String(err?.message || "");
+        if (!message.toLowerCase().includes("invalid expiry")) throw err;
+      }
+    }
+
+    setChainStatus("No chain");
+    throw new Error(lastError?.message || "No valid option-chain expiry found.");
+  }
+
   function inferStrikeStep(strikes) {
     const unique = [...new Set(strikes)].sort((a, b) => a - b);
     let step = Infinity;
@@ -433,7 +653,7 @@ function App() {
             exchange: rollExchange(),
             type: "OPT",
             values: batch,
-            fields: ["l1bid", "l1ask"],
+            fields: ["l1bid", "l1ask", "iv_bid", "iv_ask"],
             startDate: start,
             endDate: end,
             interval: "1s",
@@ -444,15 +664,16 @@ function App() {
       });
       for (const entry of data?.result?.[0]?.values || []) {
         for (const [name, symData] of Object.entries(entry)) {
+          const parsePoints = (arr, rupee = false) =>
+            (Array.isArray(arr) ? arr : [])
+              .map((p) => ({ ts: pointMs(p), v: pointNumber(p, rupee) }))
+              .filter((p) => Number.isFinite(p.ts) && Number.isFinite(p.v))
+              .sort((a, b) => a.ts - b.ts);
           seriesByName.set(name, {
-            bid: (Array.isArray(symData?.l1bid) ? symData.l1bid : [])
-              .map((p) => ({ ts: pointMs(p), v: pointNumber(p, true) }))
-              .filter((p) => Number.isFinite(p.ts) && Number.isFinite(p.v))
-              .sort((a, b) => a.ts - b.ts),
-            ask: (Array.isArray(symData?.l1ask) ? symData.l1ask : [])
-              .map((p) => ({ ts: pointMs(p), v: pointNumber(p, true) }))
-              .filter((p) => Number.isFinite(p.ts) && Number.isFinite(p.v))
-              .sort((a, b) => a.ts - b.ts)
+            bid:    parsePoints(symData?.l1bid, true),
+            ask:    parsePoints(symData?.l1ask, true),
+            ivBid:  parsePoints(symData?.iv_bid, false),
+            ivAsk:  parsePoints(symData?.iv_ask, false)
           });
         }
       }
@@ -463,8 +684,8 @@ function App() {
 
   function advanceQuote(name, seriesByName, cursorByName, ts) {
     const series = seriesByName.get(name);
-    if (!series) return { bid: 0, ask: 0 };
-    const cursor = cursorByName.get(name) || { bidIndex: 0, askIndex: 0, bid: 0, ask: 0 };
+    if (!series) return { bid: 0, ask: 0, ivBid: null, ivAsk: null };
+    const cursor = cursorByName.get(name) || { bidIndex: 0, askIndex: 0, ivBidIndex: 0, ivAskIndex: 0, bid: 0, ask: 0, ivBid: null, ivAsk: null };
     while (cursor.bidIndex < series.bid.length && series.bid[cursor.bidIndex].ts <= ts) {
       cursor.bid = series.bid[cursor.bidIndex].v;
       cursor.bidIndex += 1;
@@ -473,21 +694,52 @@ function App() {
       cursor.ask = series.ask[cursor.askIndex].v;
       cursor.askIndex += 1;
     }
+    while (cursor.ivBidIndex < (series.ivBid?.length || 0) && series.ivBid[cursor.ivBidIndex].ts <= ts) {
+      cursor.ivBid = series.ivBid[cursor.ivBidIndex].v;
+      cursor.ivBidIndex += 1;
+    }
+    while (cursor.ivAskIndex < (series.ivAsk?.length || 0) && series.ivAsk[cursor.ivAskIndex].ts <= ts) {
+      cursor.ivAsk = series.ivAsk[cursor.ivAskIndex].v;
+      cursor.ivAskIndex += 1;
+    }
     cursorByName.set(name, cursor);
     return cursor;
   }
 
   function initRollChart() {
     if (rollChart || !rollChartHost) return;
-    rollChart = makeChart(rollChartHost);
-    const bidOptions = { color: "#21d19f", lineWidth: 2, title: "Bid straddle" };
-    const askOptions = { color: "#ffb15c", lineWidth: 2, title: "Ask straddle" };
-    rollBidSeries = rollChart.addLineSeries
-      ? rollChart.addLineSeries(bidOptions)
-      : rollChart.addSeries(window.LightweightCharts.LineSeries, bidOptions);
-    rollAskSeries = rollChart.addLineSeries
-      ? rollChart.addLineSeries(askOptions)
-      : rollChart.addSeries(window.LightweightCharts.LineSeries, askOptions);
+    rollChart = makeChart(rollChartHost, {
+      leftPriceScale: {
+        visible: true,
+        borderColor: "rgba(255,255,255,0.09)",
+        scaleMargins: { top: 0.08, bottom: 0.08 },
+        minimumWidth: 72
+      },
+      rightPriceScale: {
+        visible: true,
+        borderColor: "rgba(255,255,255,0.09)",
+        scaleMargins: { top: 0.08, bottom: 0.08 }
+      }
+    });
+
+    const addLine = (opts) => rollChart.addLineSeries
+      ? rollChart.addLineSeries(opts)
+      : rollChart.addSeries(window.LightweightCharts.LineSeries, opts);
+
+    // Bid / Ask on RIGHT axis (₹ price)
+    rollBidSeries = addLine({ color: "#21d19f", lineWidth: 2, title: "Bid", priceScaleId: "right" });
+    rollAskSeries = addLine({ color: "#ffb15c", lineWidth: 2, title: "Ask", priceScaleId: "right" });
+
+    // IV on LEFT axis (% value)
+    rollIvSeries = addLine({
+      color: "#a78bfa",
+      lineWidth: 1,
+      lineStyle: 2,           // dashed
+      title: "IV %",
+      priceScaleId: "left",
+      priceFormat: { type: "custom", formatter: (p) => `${p.toFixed(1)}%`, minMove: 0.01 }
+    });
+
     queueChartResize();
   }
 
@@ -556,6 +808,7 @@ function App() {
     const cursorByName = new Map();
     const bidLine = [];
     const askLine = [];
+    const ivLine = [];
     const selected = [];
 
     for (const point of spotPoints) {
@@ -572,29 +825,234 @@ function App() {
         const ask = ceQuote.ask + peQuote.ask;
         if (bid <= 0 || ask <= 0) continue;
         const mid = (bid + ask) / 2;
-        if (!best || mid < best.mid) best = { strike, bid, ask, mid };
+        // average IV mid across CE+PE (multiply by 100 for percentage display)
+        const ceIvMid = (ceQuote.ivBid != null && ceQuote.ivAsk != null) ? (ceQuote.ivBid + ceQuote.ivAsk) / 2 : null;
+        const peIvMid = (peQuote.ivBid != null && peQuote.ivAsk != null) ? (peQuote.ivBid + peQuote.ivAsk) / 2 : null;
+        let ivMid = null;
+        if (ceIvMid != null && peIvMid != null) ivMid = ((ceIvMid + peIvMid) / 2) * 100;
+        else if (ceIvMid != null) ivMid = ceIvMid * 100;
+        else if (peIvMid != null) ivMid = peIvMid * 100;
+        if (!best || mid < best.mid) best = { strike, bid, ask, mid, ivMid };
       }
       if (!best) continue;
       bidLine.push({ time: tvTime(point.ts), value: best.bid });
       askLine.push({ time: tvTime(point.ts), value: best.ask });
+      if (best.ivMid != null && best.ivMid > 0) ivLine.push({ time: tvTime(point.ts), value: best.ivMid });
       selected.push({ ...point, ...best });
     }
     if (!selected.length) throw new Error("No complete bid/ask straddle points found.");
 
     rollBidSeries.setData(bidLine);
     rollAskSeries.setData(askLine);
+    if (ivLine.length && rollIvSeries) {
+      rollIvSeries.setData(ivLine);
+    }
     resizeChart(rollChart, rollChartHost);
     rollChart.timeScale().fitContent();
+
     const last = selected[selected.length - 1];
+    const lastIv = ivLine.length ? ivLine[ivLine.length - 1].value : null;
     setRollStats({
       spot: rupee.format(last.spot),
       strike: number.format(last.strike),
       bid: rupee.format(last.bid),
       ask: rupee.format(last.ask),
+      iv: lastIv != null ? `${lastIv.toFixed(1)}%` : "--",
       points: String(selected.length),
-      meta: `${sym} ${rollExpiry()} | 1s l1bid/l1ask | ${requiredStrikes.size} strikes | ${rollExchange()}`
+      meta: `${sym} ${rollExpiry()} | 1-second quotes | ${requiredStrikes.size} strikes checked | ${rollExchange()}`
     });
+    setRollExportData(selected);
     setRollStatus("Ready");
+  }
+
+  function downloadCSV() {
+    const rows = rollExportData();
+    if (!rows.length) return;
+    const sym = rollSymbol().trim().toUpperCase();
+    const expiry = rollExpiry();
+    const exchange = rollExchange();
+
+    // Build IST formatter for timestamp column
+    const istFmt = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false
+    });
+
+    const headers = [
+      "Timestamp_IST",
+      "Unix_ms",
+      "Symbol",
+      "Expiry",
+      "Exchange",
+      "Spot",
+      "ATM_Strike",
+      "Bid_Straddle",
+      "Ask_Straddle",
+      "Mid_Straddle",
+      "IV_Mid_Pct"
+    ];
+
+    const escape = (v) => {
+      const s = String(v ?? "");
+      return s.includes(",") || s.includes('"') || s.includes("\n") ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+
+    const lines = [headers.join(",")];
+    for (const r of rows) {
+      const ms = r.ts; // ts is already epoch-milliseconds
+      const ist = istFmt.format(new Date(ms)).replace(/(\d+)\/(\d+)\/(\d+),/, "$3-$2-$1");
+      lines.push([
+        escape(ist),
+        escape(ms),
+        escape(sym),
+        escape(expiry),
+        escape(exchange),
+        escape(r.spot?.toFixed(2) ?? ""),
+        escape(r.strike),
+        escape(r.bid?.toFixed(2) ?? ""),
+        escape(r.ask?.toFixed(2) ?? ""),
+        escape(r.mid?.toFixed(2) ?? ""),
+        escape(r.ivMid != null ? r.ivMid.toFixed(4) : "")
+      ].join(","));
+    }
+
+    const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `straddle_${sym}_${expiry}_${exchange}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadParquet() {
+    const rows = rollExportData();
+    if (!rows.length) return;
+    const sym = rollSymbol().trim().toUpperCase();
+    const expiry = rollExpiry();
+    const exchange = rollExchange();
+
+    const istFmt = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      hour12: false
+    });
+
+    const out = rows.map(r => {
+      const ms = r.ts; // ts is already epoch-milliseconds (from pointMs which divides ns by 1e6)
+      const ist = istFmt.format(new Date(ms)).replace(/(\d+)\/(\d+)\/(\d+),/, "$3-$2-$1");
+      return {
+        Timestamp_IST: ist,
+        Unix_ms:       ms,
+        Symbol:        sym,
+        Expiry:        expiry,
+        Exchange:      exchange,
+        Spot:          r.spot ?? 0,
+        ATM_Strike:    r.strike ?? 0,
+        Bid_Straddle:  r.bid ?? 0,
+        Ask_Straddle:  r.ask ?? 0,
+        Mid_Straddle:  r.mid ?? 0,
+        IV_Mid_Pct:    r.ivMid ?? 0
+      };
+    });
+
+    const buf = writeParquet(null, out);
+    const blob = new Blob([buf], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `straddle_${sym}_${expiry}_${exchange}.parquet`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleImport(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    e.target.value = "";
+    try {
+      setBusy(true);
+      setToast("");
+      const buf = await file.arrayBuffer();
+      let rows;
+
+      if (file.name.endsWith(".parquet")) {
+        rows = readParquet(buf);
+      } else {
+        // CSV import
+        const text = new TextDecoder("utf-8").decode(buf).replace(/^﻿/, "");
+        const lines = text.split(/\r?\n/).filter(Boolean);
+        const headers = lines[0].split(",").map(h => h.trim().replace(/^"|"$/g, ""));
+        rows = lines.slice(1).map(line => {
+          const vals = line.match(/(".*?"|[^,]+|(?<=,)(?=,)|^(?=,)|(?<=,)$)/g) || line.split(",");
+          const row = {};
+          headers.forEach((h, i) => { row[h] = (vals[i] || "").replace(/^"|"$/g, "").trim(); });
+          return row;
+        });
+      }
+
+      if (!rows.length) throw new Error("No data rows found in file.");
+
+      // Reconstruct selected[] from rows and replot
+      // r.Unix_ms is already epoch-milliseconds; ts field used internally is nanoseconds
+      const selected = rows.map(r => {
+        const ms = Number(r.Unix_ms); // epoch milliseconds
+        return {
+          ts:    ms,                        // keep as ms (same unit as live data)
+          tvSec: Math.floor(ms / 1000),     // seconds for LightweightCharts
+          spot:  Number(r.Spot),
+          strike: Number(r.ATM_Strike),
+          bid:   Number(r.Bid_Straddle),
+          ask:   Number(r.Ask_Straddle),
+          mid:   Number(r.Mid_Straddle),
+          ivMid: Number(r.IV_Mid_Pct) || null
+        };
+      }).filter(r => r.tvSec > 0 && r.spot > 0);
+
+      if (!selected.length) throw new Error("No valid rows after parsing.");
+
+      // Block the auto-fetch effect BEFORE updating symbols (which would trigger it)
+      setImportMode(true);
+
+      const first = rows[0];
+      if (first.Symbol) setRollSymbol(String(first.Symbol));
+      if (first.Expiry) setRollExpiry(String(first.Expiry));
+      if (first.Exchange) setRollExchange(String(first.Exchange));
+
+      setRollExportData(selected);
+
+      // Plot without fetching
+      initRollChart();
+      const bidLine = selected.map(r => ({ time: r.tvSec, value: r.bid }));
+      const askLine = selected.map(r => ({ time: r.tvSec, value: r.ask }));
+      const ivLine  = selected.filter(r => r.ivMid > 0).map(r => ({ time: r.tvSec, value: r.ivMid }));
+
+      rollBidSeries.setData(bidLine);
+      rollAskSeries.setData(askLine);
+      if (ivLine.length && rollIvSeries) rollIvSeries.setData(ivLine);
+      resizeChart(rollChart, rollChartHost);
+      rollChart.timeScale().fitContent();
+
+      const last = selected[selected.length - 1];
+      const lastIv = ivLine.length ? ivLine[ivLine.length - 1].value : null;
+      setRollStats({
+        spot:   rupee.format(last.spot),
+        strike: number.format(last.strike),
+        bid:    rupee.format(last.bid),
+        ask:    rupee.format(last.ask),
+        iv:     lastIv != null ? `${lastIv.toFixed(1)}%` : "--",
+        points: String(selected.length),
+        meta:   `Imported · ${first.Symbol || ""} ${first.Expiry || ""} · ${selected.length.toLocaleString()} rows`
+      });
+      setRollStatus("Imported");
+    } catch (err) {
+      setToast(err.message || "Import failed.");
+    } finally {
+      setBusy(false);
+    }
   }
 
   onMount(() => {
@@ -609,39 +1067,83 @@ function App() {
     queueChartResize();
   });
 
+  createEffect(() => {
+    if (!authed()) return;
+    if (importMode()) return; // don't auto-fetch when showing imported data
+    const loadKey = [
+      token().trim(),
+      deviceId().trim(),
+      rollSymbol().trim().toUpperCase(),
+      rollType(),
+      rollExchange(),
+      rollStart(),
+      rollEnd()
+    ].join("|");
+    if (autoRollLoadedKey === loadKey) return;
+    autoRollLoadedKey = loadKey;
+    untrack(() => run(loadRollingStraddle));
+  });
+
+  createEffect(() => {
+    if (!authed() || section() !== "chain") return;
+    const loadKey = [
+      token().trim(),
+      deviceId().trim(),
+      chainSymbol().trim().toUpperCase(),
+      chainExchange(),
+      chainExpiry()
+    ].join("|");
+    if (autoChainLoadedKey === loadKey) return;
+    autoChainLoadedKey = loadKey;
+    untrack(() => run(loadOptionChain));
+  });
+
+  const navButtonStyle = (name) => section() === name
+    ? "border-color:rgba(5,184,120,.42);background:rgba(5,184,120,.12);color:#ffffff"
+    : "";
+
   return (
-    <div class="min-h-screen bg-[#0B0E11] text-gray-200">
-      <header class="flex items-center justify-between border-b border-slate-800/80 bg-[#12161A] px-3 py-2">
+    <div class="min-h-screen" style="background:var(--bg-main);color:var(--text-primary)">
+      <header class="flex items-center justify-between px-5 py-2.5" style="background:var(--bg-panel);border-bottom:1px solid var(--border-subtle)">
         <div class="flex min-w-0 items-center gap-3">
-          <div class="grid h-8 w-8 place-items-center bg-cyan-500 font-black text-[#0B0E11]">N</div>
+          <div class="grid h-7 w-7 shrink-0 place-items-center rounded font-bold text-xs" style="background:var(--accent-cyan);color:#0d1117">N</div>
           <div class="min-w-0">
-            <p class="text-[10px] font-bold uppercase tracking-normal text-cyan-400">Nubra Market Research</p>
-            <h1 class="truncate text-sm font-semibold text-white">Options Intelligence Workstation</h1>
+            <p class="text-[9px] font-semibold" style="color:var(--text-tertiary);letter-spacing:0">Nubra</p>
+            <h1 class="truncate text-[13px] font-semibold" style="color:var(--text-primary)">Options Intelligence</h1>
           </div>
         </div>
 
-        <nav class="flex items-center border border-slate-800/80 bg-[#0B0E11] p-0.5 text-xs">
+        <nav class="flex items-center gap-0.5 rounded-md p-0.5 text-xs" style="background:#0d1117;border:1px solid var(--border-subtle)">
           <button
-            class={`px-4 py-1.5 font-medium transition-colors ${section() === "rolling" ? "bg-gray-100 text-gray-950" : "text-gray-400 hover:text-white"}`}
+            class={`rounded border border-transparent px-4 py-1.5 text-xs font-medium transition-all duration-150 ${section() === "rolling" ? "" : "readable-muted hover:text-white"}`}
+            style={navButtonStyle("rolling")}
             onClick={() => setSection("rolling")}
           >
             Rolling Straddle
           </button>
           <button
-            class={`px-4 py-1.5 font-medium transition-colors ${section() === "market" ? "bg-gray-100 text-gray-950" : "text-gray-400 hover:text-white"}`}
+            class={`rounded border border-transparent px-4 py-1.5 text-xs font-medium transition-all duration-150 ${section() === "chain" ? "" : "readable-muted hover:text-white"}`}
+            style={navButtonStyle("chain")}
+            onClick={() => setSection("chain")}
+          >
+            Option Chain
+          </button>
+          <button
+            class={`rounded border border-transparent px-4 py-1.5 text-xs font-medium transition-all duration-150 ${section() === "market" ? "" : "readable-muted hover:text-white"}`}
+            style={navButtonStyle("market")}
             onClick={() => setSection("market")}
           >
             Market Chart
           </button>
         </nav>
 
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2.5">
           <button class="terminal-button-secondary" onClick={() => setDrawerOpen(true)}>
             Session
           </button>
-          <div class="flex items-center gap-2 border border-slate-800/80 bg-[#161A1E] px-3 py-1.5 text-xs font-medium text-gray-300">
-            <span class={`h-2 w-2 ${authed() ? "bg-emerald-400" : "bg-orange-400"}`}></span>
-            {authed() ? "Session ready" : "Session needed"}
+          <div class="flex items-center gap-2 rounded px-3 py-1.5 text-[11px] font-medium" style="background:#0d1117;border:1px solid var(--border-subtle);color:var(--text-secondary)">
+            <span class={`h-1.5 w-1.5 rounded-full ${authed() ? "bg-emerald-400" : "bg-amber-400"}`}></span>
+            <span>{authed() ? "Connected" : "No session"}</span>
           </div>
         </div>
       </header>
@@ -650,147 +1152,393 @@ function App() {
         <div class="fixed inset-0 z-40 bg-black/50" onClick={() => setDrawerOpen(false)}></div>
       </Show>
 
-      <aside class={`fixed inset-y-0 left-0 z-50 w-[360px] border-r border-gray-800 bg-[#12161A] shadow-2xl transition-transform duration-200 ${drawerOpen() ? "translate-x-0" : "-translate-x-full"}`}>
-        <div class="flex items-center justify-between border-b border-gray-800 px-4 py-3">
+      <aside class={`fixed inset-y-0 left-0 z-50 w-[340px] shadow-2xl transition-transform duration-200 ${drawerOpen() ? "translate-x-0" : "-translate-x-full"}`} style="background:var(--bg-panel);border-right:1px solid var(--border-subtle)">
+        <div class="flex items-center justify-between px-5 py-3.5" style="border-bottom:1px solid var(--border-subtle)">
           <div>
-            <p class="text-[10px] font-bold uppercase text-cyan-400">Connection</p>
-            <h2 class="text-sm font-semibold text-white">Nubra Session</h2>
+            <p class="text-[9px] font-semibold" style="color:var(--text-tertiary);letter-spacing:0">Connection</p>
+            <h2 class="text-[13px] font-semibold" style="color:var(--text-primary)">Nubra Session</h2>
           </div>
-          <button class="terminal-button-secondary px-2" onClick={() => setDrawerOpen(false)}>Close</button>
+          <button class="terminal-button-secondary px-2.5 py-1" onClick={() => setDrawerOpen(false)}>✕</button>
         </div>
 
-        <div class="space-y-5 p-4">
-          <section class="space-y-3">
-            <label class="grid gap-1 text-[11px] font-medium text-gray-400">
+        <div class="space-y-5 p-5">
+          <section class="space-y-3.5">
+            <label class="grid gap-1.5 text-[10px] font-semibold" style="color:var(--text-muted);letter-spacing:0">
               Environment
               <select class="terminal-input" value={environment()} onInput={(e) => setEnvironment(e.currentTarget.value)}>
                 <option value="https://api.nubra.io">Production</option>
                 <option value="https://uatapi.nubra.io">UAT</option>
               </select>
             </label>
-            <label class="grid gap-1 text-[11px] font-medium text-gray-400">
-              Session token
+            <label class="grid gap-1.5 text-[10px] font-semibold" style="color:var(--text-muted);letter-spacing:0">
+              Session Token
               <input class="terminal-input" type="password" value={token()} onInput={(e) => {
                 setToken(e.currentTarget.value);
                 localStorage.setItem("nubraSessionToken", e.currentTarget.value);
-              }} placeholder="Bearer session token" />
+              }} placeholder="Bearer …" />
             </label>
-            <label class="grid gap-1 text-[11px] font-medium text-gray-400">
+            <label class="grid gap-1.5 text-[10px] font-semibold" style="color:var(--text-muted);letter-spacing:0">
               Device ID
               <input class="terminal-input" value={deviceId()} onInput={(e) => {
                 setDeviceId(e.currentTarget.value);
                 localStorage.setItem("nubraDeviceId", e.currentTarget.value);
-              }} placeholder="Nubra-OSS-..." />
+              }} placeholder="Nubra-OSS-…" />
             </label>
           </section>
 
-          <section class="space-y-3 border-t border-gray-800 pt-4">
-            <div class="grid grid-cols-2 gap-2">
-              <label class="grid gap-1 text-[11px] font-medium text-gray-400">
+          <section class="space-y-3.5 pt-4" style="border-top:1px solid var(--border-subtle)">
+            <div class="grid grid-cols-2 gap-3">
+              <label class="grid gap-1.5 text-[10px] font-semibold" style="color:var(--text-muted);letter-spacing:0">
                 Method
                 <select class="terminal-input" value={authMethod()} onInput={(e) => setAuthMethod(e.currentTarget.value)}>
                   <option value="otp">SMS OTP</option>
                   <option value="totp">TOTP</option>
                 </select>
               </label>
-              <label class="grid gap-1 text-[11px] font-medium text-gray-400">
+              <label class="grid gap-1.5 text-[10px] font-semibold" style="color:var(--text-muted);letter-spacing:0">
                 Phone
-                <input class="terminal-input" value={phone()} onInput={(e) => setPhone(e.currentTarget.value)} placeholder="Registered phone" />
+                <input class="terminal-input" value={phone()} onInput={(e) => setPhone(e.currentTarget.value)} placeholder="Mobile number" />
               </label>
             </div>
             <button class="terminal-button w-full" onClick={() => run(startLogin)} disabled={busy()}>Start Login</button>
-            <div class="grid grid-cols-2 gap-2">
-              <label class="grid gap-1 text-[11px] font-medium text-gray-400">
+            <div class="grid grid-cols-2 gap-3">
+              <label class="grid gap-1.5 text-[10px] font-semibold" style="color:var(--text-muted);letter-spacing:0">
                 OTP / TOTP
                 <input class="terminal-input" value={otp()} onInput={(e) => setOtp(e.currentTarget.value)} inputmode="numeric" />
               </label>
-              <label class="grid gap-1 text-[11px] font-medium text-gray-400">
+              <label class="grid gap-1.5 text-[10px] font-semibold" style="color:var(--text-muted);letter-spacing:0">
                 MPIN
                 <input class="terminal-input" type="password" value={mpin()} onInput={(e) => setMpin(e.currentTarget.value)} inputmode="numeric" />
               </label>
             </div>
-            <div class="grid grid-cols-2 gap-2">
+            <div class="grid grid-cols-2 gap-3">
               <button class="terminal-button-secondary" onClick={() => run(verifyCode)} disabled={busy()}>Verify Code</button>
               <button class="terminal-button-secondary" onClick={() => run(verifyMpin)} disabled={busy()}>Verify MPIN</button>
             </div>
-            <p class="text-xs leading-5 text-gray-400">{loginStatus()}</p>
+            <p class="text-[11px] leading-5" style="color:var(--text-secondary)">{loginStatus()}</p>
           </section>
         </div>
       </aside>
 
-      <main class="flex min-h-[calc(100vh-49px)] flex-col">
+      <main class="flex flex-col" style="background:var(--bg-main)">
         <Show when={toast()}>
-          <div class="border-b border-red-900/60 bg-red-950/30 px-3 py-2 text-xs font-medium text-red-200">{toast()}</div>
+          <div class="flex items-center gap-2.5 px-5 py-2 text-[11px] font-medium" style="background:rgba(239,68,68,0.07);border-bottom:1px solid rgba(239,68,68,0.18);color:#fca5a5">
+            <span class="shrink-0 opacity-60">⚠</span>
+            {toast()}
+          </div>
         </Show>
 
         <Show when={section() === "rolling"}>
-          <section class="flex flex-wrap items-center gap-2 border-b border-slate-800/80 bg-[#151A20] px-3 py-2 text-xs">
+          {/* ── Toolbar ── */}
+          <div class="control-panel">
             <label class="terminal-label">
               Underlying
-              <input class="terminal-input w-28" value={rollSymbol()} onInput={(e) => setRollSymbol(e.currentTarget.value.toUpperCase())} />
+              <input class="terminal-input w-24" value={rollSymbol()} onInput={(e) => setRollSymbol(e.currentTarget.value.toUpperCase())} />
             </label>
             <label class="terminal-label">
               Type
-              <select class="terminal-input w-24" value={rollType()} onInput={(e) => setRollType(e.currentTarget.value)}>
+              <select class="terminal-input" value={rollType()} onInput={(e) => setRollType(e.currentTarget.value)}>
                 <option value="INDEX">INDEX</option>
                 <option value="STOCK">STOCK</option>
               </select>
             </label>
             <label class="terminal-label">
               Exchange
-              <select class="terminal-input w-20" value={rollExchange()} onInput={(e) => setRollExchange(e.currentTarget.value)}>
+              <select class="terminal-input" value={rollExchange()} onInput={(e) => setRollExchange(e.currentTarget.value)}>
                 <option value="NSE">NSE</option>
                 <option value="BSE">BSE</option>
               </select>
             </label>
             <label class="terminal-label">
               Expiry
-              <select class="terminal-input w-32" value={rollExpiry()} onInput={(e) => setRollExpiry(e.currentTarget.value)}>
+              <select class="terminal-input w-28" value={rollExpiry()} onInput={(e) => setRollExpiry(e.currentTarget.value)}>
                 <option value="">Auto</option>
                 <For each={rollExpiries()}>{(expiry) => <option value={expiry}>{expiry}</option>}</For>
               </select>
             </label>
+            <div class="h-6 w-px shrink-0" style="background:var(--border-muted)"></div>
             <label class="terminal-label">
               Start
-              <input class="terminal-input w-44" type="datetime-local" value={rollStart()} onInput={(e) => setRollStart(e.currentTarget.value)} />
+              <input class="terminal-input w-40" type="datetime-local" value={rollStart()} onInput={(e) => setRollStart(e.currentTarget.value)} />
             </label>
             <label class="terminal-label">
               End
-              <input class="terminal-input w-44" type="datetime-local" value={rollEnd()} onInput={(e) => setRollEnd(e.currentTarget.value)} />
+              <input class="terminal-input w-40" type="datetime-local" value={rollEnd()} onInput={(e) => setRollEnd(e.currentTarget.value)} />
             </label>
             <div class="ml-auto flex items-center gap-2">
               <button class="terminal-button-secondary" onClick={() => run(loadRollingExpiries)} disabled={busy()}>Load Expiries</button>
-              <button class="terminal-button" onClick={() => run(loadRollingStraddle)} disabled={busy()}>Plot Rolling</button>
+
+              {/* Import button — always visible */}
+              <label class="terminal-button-secondary flex cursor-pointer items-center gap-1.5" title="Import CSV or Parquet file">
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" style="flex-shrink:0">
+                  <path d="M6 9V2M3.5 4.5L6 2l2.5 2.5M2 10h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                Import
+                <input ref={importFileRef} type="file" accept=".csv,.parquet" class="sr-only" onChange={handleImport} />
+              </label>
+
+              {/* Download buttons — only after data is loaded */}
+              <Show when={rollExportData().length > 0}>
+                <div class="flex items-center" style="border:1px solid var(--border-muted);border-radius:5px;overflow:hidden">
+                  <button
+                    class="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-all duration-150"
+                    style="color:var(--text-secondary);background:transparent;border-right:1px solid var(--border-muted)"
+                    onClick={downloadCSV}
+                    title={`Download ${rollExportData().length.toLocaleString()} rows as CSV`}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" style="flex-shrink:0">
+                      <path d="M6 1v7M3.5 5.5L6 8l2.5-2.5M2 10h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    CSV
+                  </button>
+                  <button
+                    class="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-all duration-150"
+                    style="color:var(--text-secondary);background:transparent"
+                    onClick={downloadParquet}
+                    title={`Download ${rollExportData().length.toLocaleString()} rows as Parquet`}
+                  >
+                    <svg width="11" height="11" viewBox="0 0 12 12" fill="none" style="flex-shrink:0">
+                      <path d="M6 1v7M3.5 5.5L6 8l2.5-2.5M2 10h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    Parquet
+                  </button>
+                </div>
+              </Show>
+
+              <button class="terminal-button" onClick={() => { setImportMode(false); autoRollLoadedKey = ""; run(loadRollingStraddle); }} disabled={busy()}>Plot Rolling</button>
             </div>
-          </section>
+          </div>
 
-          <section class="grid grid-cols-4 border-b border-gray-800 bg-[#11161B] px-4 py-2">
-            <Metric label="Spot" value={rollStats().spot} />
-            <Metric label="Selected strike" value={rollStats().strike} />
-            <Metric label="Bid straddle" value={rollStats().bid} />
-            <Metric label="Ask straddle" value={rollStats().ask} />
-          </section>
+          {/* ── Chart workspace ── */}
+          <div class="chart-workspace">
+            {/* Metrics sidebar */}
+            <aside class="chart-sidebar">
+              <div class="sidebar-metric">
+                <span class="sidebar-label">Spot</span>
+                <strong class="sidebar-value">{rollStats().spot}</strong>
+              </div>
+              <div class="sidebar-divider" />
+              <div class="sidebar-metric">
+                <span class="sidebar-label">Strike</span>
+                <strong class="sidebar-value">{rollStats().strike}</strong>
+              </div>
+              <div class="sidebar-divider" />
+              <div class="sidebar-metric">
+                <span class="sidebar-label">Bid</span>
+                <strong class="sidebar-value bid">{rollStats().bid}</strong>
+              </div>
+              <div class="sidebar-divider" />
+              <div class="sidebar-metric">
+                <span class="sidebar-label">Ask</span>
+                <strong class="sidebar-value ask">{rollStats().ask}</strong>
+              </div>
+              <div class="sidebar-divider" />
+              <div class="sidebar-metric">
+                <span class="sidebar-label">IV Mid</span>
+                <strong class="sidebar-value iv">{rollStats().iv}</strong>
+              </div>
+              <div class="mt-auto sidebar-divider" />
+              <div class="sidebar-status">
+                <span class="sidebar-label">Status</span>
+                <span class="sidebar-status-value">{rollStatus()}</span>
+              </div>
+            </aside>
 
-          <section class="flex items-center justify-between border-b border-slate-800/80 bg-[#0E1217] px-3 py-2">
-            <div>
-              <h2 class="text-sm font-semibold text-white">Rolling Straddle</h2>
-              <p class="font-mono text-[11px] text-gray-500">{rollStats().meta}</p>
+            {/* Single chart card — Bid/Ask on right axis, IV on left axis */}
+            <div class="chart-card">
+              <div class="chart-card-header">
+                <div>
+                  <h2 class="chart-card-title">Rolling Straddle</h2>
+                  <p class="chart-card-meta">{rollStats().meta}</p>
+                </div>
+                <div class="flex items-center gap-4 text-[10px]">
+                  <span class="flex items-center gap-1.5">
+                    <span class="inline-block h-2 w-4 rounded-sm" style="background:#21d19f"></span>
+                    <span style="color:var(--text-muted)">Bid ₹</span>
+                  </span>
+                  <span class="flex items-center gap-1.5">
+                    <span class="inline-block h-2 w-4 rounded-sm" style="background:#ffb15c"></span>
+                    <span style="color:var(--text-muted)">Ask ₹</span>
+                  </span>
+                  <span class="flex items-center gap-1.5">
+                    <span class="inline-block h-px w-4" style="background:#a78bfa;border-top:2px dashed #a78bfa"></span>
+                    <span style="color:var(--text-muted)">IV % (left)</span>
+                  </span>
+                </div>
+              </div>
+              <div class="chart-card-body" ref={(el) => { rollChartHost = el; initRollChart(); queueChartResize(); }}></div>
             </div>
-            <div class="font-mono text-[11px] text-gray-400">Status: <span class="text-white">{rollStatus()}</span></div>
-          </section>
+          </div>
+        </Show>
 
-          <div class="chart-surface flex-1" ref={(el) => { rollChartHost = el; initRollChart(); queueChartResize(); }}></div>
+        <Show when={section() === "chain"}>
+          <div class="chain-market-strip">
+            <Metric label="Spot" value={formatMoney(chainData()?.cp)} />
+            <Metric label="ATM Strike" value={formatStrike(chainData()?.atm)} />
+            <Metric label="Expiry" value={chainData()?.expiry || chainExpiry() || "Auto"} />
+            <Metric label="Strikes" value={String(optionRows().length)} />
+            <Metric label="Status" value={chainStatus()} />
+          </div>
+
+          <div class="option-chain-workspace">
+            <aside class="chain-sidebar">
+              <div class="chain-kicker">Option Chain</div>
+              <h2 class="chain-title">{chainData()?.asset || chainSymbol()}</h2>
+              <div class="chain-subtitle">{chainExchange()} · {chainData()?.expiry || chainExpiry() || "Auto"}</div>
+
+              <div class="chain-stat-grid">
+                <div class="chain-stat">
+                  <span>Spot</span>
+                  <strong>{formatMoney(chainData()?.cp)}</strong>
+                </div>
+                <div class="chain-stat">
+                  <span>ATM</span>
+                  <strong>{formatStrike(chainData()?.atm)}</strong>
+                </div>
+                <div class="chain-stat">
+                  <span>Strikes</span>
+                  <strong>{optionRows().length}</strong>
+                </div>
+                <div class="chain-stat">
+                  <span>Status</span>
+                  <strong>{chainStatus()}</strong>
+                </div>
+              </div>
+            </aside>
+
+            <section class="chain-table-card">
+              <div class="chain-table-header">
+                <div>
+                  <div class="flex items-center gap-2">
+                    <h2>Options Chain</h2>
+                    <span class="chain-ready">{chainStatus()}</span>
+                  </div>
+                  <p>{chainData()?.asset || chainSymbol()} · {chainExchange()} · {chainData()?.expiry || chainExpiry() || "Auto"} · prices in rupees</p>
+                </div>
+                <div class="chain-actions">
+                  <label class="chain-inline-field">
+                    Underlying
+                    <input class="terminal-input w-24" value={chainSymbol()} onInput={(e) => {
+                      setChainSymbol(e.currentTarget.value.toUpperCase());
+                      setChainData(null);
+                      setChainExpiry("");
+                      setChainExpiries([]);
+                    }} />
+                  </label>
+                  <label class="chain-inline-field">
+                    Exchange
+                    <select class="terminal-input" value={chainExchange()} onInput={(e) => {
+                      setChainExchange(e.currentTarget.value);
+                      setChainData(null);
+                      setChainExpiry("");
+                      setChainExpiries([]);
+                    }}>
+                      <option value="NSE">NSE</option>
+                      <option value="BSE">BSE</option>
+                    </select>
+                  </label>
+                  <label class="chain-inline-field">
+                    Expiry
+                    <select class="terminal-input w-32" value={chainExpiry()} onInput={(e) => {
+                      setChainExpiry(e.currentTarget.value);
+                      setChainData(null);
+                    }}>
+                      <option value="">Auto</option>
+                      <For each={chainExpiries()}>{(expiry) => <option value={expiry}>{expiry}</option>}</For>
+                    </select>
+                  </label>
+                  <button class="terminal-button-secondary" onClick={() => run(loadOptionChainExpiries)} disabled={busy()}>Expiries</button>
+                  <button class="terminal-button" onClick={() => { autoChainLoadedKey = ""; run(loadOptionChain); }} disabled={busy()}>Load</button>
+                  <div class="chain-column-menu">
+                    <button class="chain-icon-button" title="Choose columns" onClick={() => setChainColumnMenuOpen((open) => !open)}>Columns</button>
+                    <Show when={chainColumnMenuOpen()}>
+                      <div class="chain-column-popover">
+                        <button class="chain-column-all" onClick={showAllChainColumns}>All columns</button>
+                        <For each={CHAIN_COLUMNS}>
+                          {(column) => (
+                            <label class="chain-check-row">
+                              <input
+                                type="checkbox"
+                                checked={chainVisibleColumns()[column.key]}
+                                onInput={() => toggleChainColumn(column.key)}
+                              />
+                              <span>{column.label}</span>
+                            </label>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                  </div>
+                  <label class="chain-inline-field chain-range-field">
+                    ATM Range
+                    <input class="chain-filter" value={chainAtmRange()} placeholder="±800 / +2" onInput={(e) => setChainAtmRange(e.currentTarget.value)} />
+                  </label>
+                  <div class="chain-pill">{chainData()?.all_expiries?.length || chainExpiries().length || 0} expiries</div>
+                </div>
+              </div>
+
+              <div class="chain-table-wrap">
+                <Show
+                  when={visibleOptionRows().length}
+                  fallback={<div class="chain-empty">Load the option chain to view strikes, prices, OI, volume and Greeks.</div>}
+                >
+                  <table class="chain-table">
+                    <thead>
+                      <tr class="chain-group-row">
+                        <th colSpan={visibleColumnCount()}>Calls</th>
+                        <th class="strike-head">Strike Price</th>
+                        <th colSpan={visibleColumnCount()}>Puts</th>
+                      </tr>
+                      <tr>
+                        <For each={visibleCallColumns()}>
+                          {(key) => <th class={key === "iv" ? "chain-head-iv" : key === "ltp" ? "chain-head-ltp" : ""}>{chainColumnLabel(key)}</th>}
+                        </For>
+                        <th class="strike-head">Strike Price</th>
+                        <For each={visiblePutColumns()}>
+                          {(key) => <th class={key === "iv" ? "chain-head-iv" : key === "ltp" ? "chain-head-ltp" : ""}>{chainColumnLabel(key)}</th>}
+                        </For>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <For each={visibleOptionRows()}>
+                        {(row) => (
+                          <tr class={Number(row.strike) === Number(chainData()?.atm) ? "atm-row" : ""}>
+                            <For each={visibleCallColumns()}>
+                              {(key, index) => {
+                                const props = optionCellProps(row.ce, key);
+                                const sideClass = index() === 0 ? "chain-side-call-start" : index() === visibleCallColumns().length - 1 ? "chain-side-call-end" : "";
+                                return <OptionCell {...props} tone={props.tone === "oi" ? "oi-call" : props.tone} class={sideClass} />;
+                              }}
+                            </For>
+                            <td class="strike-cell">{formatStrike(row.strike)}</td>
+                            <For each={visiblePutColumns()}>
+                              {(key, index) => {
+                                const props = optionCellProps(row.pe, key);
+                                const sideClass = index() === 0 ? "chain-side-put-start" : index() === visiblePutColumns().length - 1 ? "chain-side-put-end" : "";
+                                return <OptionCell {...props} tone={props.tone === "oi" ? "oi-put" : props.tone} class={sideClass} />;
+                              }}
+                            </For>
+                          </tr>
+                        )}
+                      </For>
+                    </tbody>
+                  </table>
+                </Show>
+              </div>
+            </section>
+          </div>
         </Show>
 
         <Show when={section() === "market"}>
-          <section class="flex flex-wrap items-center gap-2 border-b border-slate-800/80 bg-[#151A20] px-3 py-2 text-xs">
+          {/* ── Toolbar ── */}
+          <div class="control-panel">
             <label class="terminal-label">
               Symbol
-              <input class="terminal-input w-28" value={symbol()} onInput={(e) => setSymbol(e.currentTarget.value.toUpperCase())} />
+              <input class="terminal-input w-24" value={symbol()} onInput={(e) => setSymbol(e.currentTarget.value.toUpperCase())} />
             </label>
             <label class="terminal-label">
               Type
-              <select class="terminal-input w-24" value={instrumentType()} onInput={(e) => setInstrumentType(e.currentTarget.value)}>
+              <select class="terminal-input" value={instrumentType()} onInput={(e) => setInstrumentType(e.currentTarget.value)}>
                 <option value="INDEX">INDEX</option>
                 <option value="STOCK">STOCK</option>
                 <option value="FUT">FUT</option>
@@ -799,14 +1547,14 @@ function App() {
             </label>
             <label class="terminal-label">
               Exchange
-              <select class="terminal-input w-20" value={exchange()} onInput={(e) => setExchange(e.currentTarget.value)}>
+              <select class="terminal-input" value={exchange()} onInput={(e) => setExchange(e.currentTarget.value)}>
                 <option value="NSE">NSE</option>
                 <option value="BSE">BSE</option>
               </select>
             </label>
             <label class="terminal-label">
               Interval
-              <select class="terminal-input w-20" value={interval()} onInput={(e) => setIntervalValue(e.currentTarget.value)}>
+              <select class="terminal-input" value={interval()} onInput={(e) => setIntervalValue(e.currentTarget.value)}>
                 <option value="1s">1s</option>
                 <option value="1m">1m</option>
                 <option value="3m">3m</option>
@@ -816,36 +1564,61 @@ function App() {
                 <option value="1d">1d</option>
               </select>
             </label>
+            <div class="h-6 w-px shrink-0" style="background:var(--border-muted)"></div>
             <label class="terminal-label">
               Start
-              <input class="terminal-input w-44" type="datetime-local" value={startDate()} onInput={(e) => setStartDate(e.currentTarget.value)} />
+              <input class="terminal-input w-40" type="datetime-local" value={startDate()} onInput={(e) => setStartDate(e.currentTarget.value)} />
             </label>
             <label class="terminal-label">
               End
-              <input class="terminal-input w-44" type="datetime-local" value={endDate()} onInput={(e) => setEndDate(e.currentTarget.value)} />
+              <input class="terminal-input w-40" type="datetime-local" value={endDate()} onInput={(e) => setEndDate(e.currentTarget.value)} />
             </label>
             <div class="ml-auto flex items-center gap-2">
               <button class="terminal-button-secondary" onClick={() => run(loadSpotPrice)} disabled={busy()}>Spot</button>
               <button class="terminal-button" onClick={() => run(loadPriceChart)} disabled={busy()}>Load Chart</button>
             </div>
-          </section>
+          </div>
 
-          <section class="grid grid-cols-4 border-b border-gray-800 bg-[#11161B] px-4 py-2">
-            <Metric label="Spot" value={spot()} />
-            <Metric label="Change" value={change()} />
-            <Metric label="Candles" value={String(candleCount())} />
-            <Metric label="Status" value={chartStatus()} />
-          </section>
+          {/* ── Chart workspace ── */}
+          <div class="chart-workspace">
+            {/* Metrics sidebar */}
+            <aside class="chart-sidebar">
+              <div class="sidebar-metric">
+                <span class="sidebar-label">Spot</span>
+                <strong class="sidebar-value">{spot()}</strong>
+              </div>
+              <div class="sidebar-divider" />
+              <div class="sidebar-metric">
+                <span class="sidebar-label">Change</span>
+                <strong class="sidebar-value">{change()}</strong>
+              </div>
+              <div class="sidebar-divider" />
+              <div class="sidebar-metric">
+                <span class="sidebar-label">Candles</span>
+                <strong class="sidebar-value">{String(candleCount())}</strong>
+              </div>
+              <div class="mt-auto pt-4 sidebar-divider" />
+              <div class="sidebar-status">
+                <span class="sidebar-label">Status</span>
+                <span class="sidebar-status-value">{chartStatus()}</span>
+              </div>
+            </aside>
 
-          <section class="flex items-center justify-between border-b border-slate-800/80 bg-[#0E1217] px-3 py-2">
-            <div>
-              <h2 class="text-sm font-semibold text-white">Market Chart</h2>
-              <p class="font-mono text-[11px] text-gray-500">{symbol()} {interval()} price candles in IST</p>
+            {/* Chart card */}
+            <div class="chart-card">
+              <div class="chart-card-header">
+                <div>
+                  <h2 class="chart-card-title">{symbol()}</h2>
+                  <p class="chart-card-meta">{interval()} · Price candles · IST</p>
+                </div>
+                <div class="flex items-center gap-1.5 text-[10px] font-semibold" style="letter-spacing:0">
+                  <span class={`h-1.5 w-1.5 rounded-full ${authed() ? "bg-emerald-400" : "bg-amber-400"}`}></span>
+                  <span style={`color:${authed() ? "#34d399" : "#fbbf24"}`}>{authed() ? "Live" : "No session"}</span>
+                </div>
+              </div>
+              <div class="chart-card-body" ref={(el) => { priceChartHost = el; initPriceChart(); queueChartResize(); }}></div>
             </div>
-            <div class="font-mono text-[11px] text-gray-400">Session: <span class="text-white">{authed() ? "READY" : "MISSING"}</span></div>
-          </section>
-
-          <div class="chart-surface flex-1" ref={(el) => { priceChartHost = el; initPriceChart(); queueChartResize(); }}></div>
+          </div>
         </Show>
       </main>
     </div>
@@ -858,7 +1631,7 @@ function Panel(props) {
       <div class="border-b border-gray-800 px-3 py-2">
         <div>
           <h3 class="text-sm font-semibold text-white">{props.title}</h3>
-          <p class="font-mono text-[11px] text-gray-500">{props.subtitle}</p>
+          <p class="text-[11px] readable-muted">{props.subtitle}</p>
         </div>
       </div>
       {props.children}
@@ -868,13 +1641,24 @@ function Panel(props) {
 
 function Metric(props) {
   return (
-    <div class="min-w-0 px-3 first:pl-0">
-      <div class="flex min-w-0 items-baseline gap-2">
-        <span class="metric-label">{props.label}</span>
-        <strong class="metric-value">{props.value}</strong>
-      </div>
+    <div class="metric-item">
+      <span class="metric-label">{props.label}</span>
+      <strong class="metric-value">{props.value}</strong>
     </div>
   );
+}
+
+function OptionCell(props) {
+  const n = Number(props.value);
+  const hasValue = Number.isFinite(n);
+  const display = () => {
+    if (!hasValue) return "--";
+    if (props.money) return formatMoney(n);
+    if (props.compact) return formatCompact(n);
+    return `${formatPlain(n, props.digits ?? 2)}${props.suffix || ""}`;
+  };
+  const className = () => [props.class, props.tone ? `chain-cell-${props.tone}` : ""].filter(Boolean).join(" ");
+  return <td class={className()}>{display()}</td>;
 }
 
 render(() => <App />, document.getElementById("root"));
